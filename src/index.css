@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+@theme {
+  @keyframes scanShadow {
+    from { top: 0; opacity: 1; }
+    to { top: 100%; opacity: 0; }
+  }
+}
+
+@layer utilities {
+  .animate-scanShadow {
+    animation: scanShadow 1s linear infinite;
+  }
+}
