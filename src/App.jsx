@@ -26,6 +26,14 @@ export default function App() {
   const [interimTranscript, setInterimTranscript] = useState("");
   const recognitionRef = useRef(null);
 
+  // Questionnaire State
+  const [questionnaire, setQuestionnaire] = useState({
+    date: new Date().toISOString().split('T')[0],
+    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
+    location: "Current Location",
+    otherDetails: ""
+  });
+
   // Load jsPDF dynamically on mount
   useEffect(() => {
     const script = document.createElement('script');
@@ -239,8 +247,8 @@ export default function App() {
   const handleStop = () => {
     stopAll();
     stopRecording();
-    setSessionState('ended');
-    setInspectionStatus("Inspection ended. Report generated.");
+    setSessionState('voice-claim');
+    setInspectionStatus("Inspection paused. Please complete the Voice Claim and Questionnaire.");
   };
 
   const handleForceCapture = async () => {
@@ -417,34 +425,44 @@ export default function App() {
     let yOffset = 45;
 
     // --- RE-IMPLEMENTING PREMIUM GREY BOX ---
-    if (voiceData || rawTranscript) {
+    if (voiceData || rawTranscript || questionnaire.location !== "Current Location" || questionnaire.otherDetails) {
       doc.setFillColor(245, 247, 250);
-      doc.rect(20, yOffset, pageWidth - 40, 60, 'F');
+      doc.rect(20, yOffset, pageWidth - 40, 85, 'F');
       
       doc.setFontSize(13);
       doc.setTextColor(40);
       doc.setFont(undefined, 'bold');
-      doc.text("Incident Statement Analysis", 25, yOffset + 12);
+      doc.text("Incident Statement & Questionnaire", 25, yOffset + 12);
+      
+      doc.setFontSize(9);
+      doc.setFont(undefined, 'normal');
+      doc.setTextColor(60);
+      doc.text(`Date: ${questionnaire.date}  |  Time: ${questionnaire.time}`, 25, yOffset + 22);
+      doc.text(`Location: ${questionnaire.location}`, 25, yOffset + 28);
       
       doc.setFontSize(9);
       doc.setFont(undefined, 'italic');
       doc.setTextColor(110);
       const transcriptStr = rawTranscript || "No verbal statement recorded.";
-      const transcriptLines = doc.splitTextToSize(`Raw Voice Input: "${transcriptStr}"`, pageWidth - 50);
-      doc.text(transcriptLines, 25, yOffset + 22);
+      const transcriptLines = doc.splitTextToSize(`Voice Info: "${transcriptStr}"`, pageWidth - 50);
+      doc.text(transcriptLines, 25, yOffset + 38);
       
       if (voiceData) {
         doc.setFontSize(9);
         doc.setFont(undefined, 'normal');
         doc.setTextColor(80);
-        doc.text(`AI Summary: ${voiceData.summary || 'Summary pending.'}`, 25, yOffset + 42);
+        doc.text(`AI Summary: ${voiceData.summary || 'Summary pending.'}`, 25, yOffset + 60);
         
         if (voiceData.damage_description) {
           const vDamageLines = doc.splitTextToSize(`Reported Damage: ${voiceData.damage_description}`, pageWidth - 50);
-          doc.text(vDamageLines, 25, yOffset + 50);
+          doc.text(vDamageLines, 25, yOffset + 68);
         }
+      } else if (questionnaire.otherDetails) {
+        const detailsLines = doc.splitTextToSize(`Additional Details: ${questionnaire.otherDetails}`, pageWidth - 50);
+        doc.text(detailsLines, 25, yOffset + 60);
       }
-      yOffset += 75;
+
+      yOffset += 100;
     }
 
     doc.setFontSize(15);
@@ -547,18 +565,6 @@ export default function App() {
               </button>
             )}
 
-            <button
-              onClick={recordingState === 'recording' ? stopRecording : startRecording}
-              disabled={recordingState === 'analyzing'}
-              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${
-                recordingState === 'recording' 
-                ? 'bg-red-500 animate-pulse text-white' 
-                : 'bg-white text-neutral-700 border border-neutral-200 hover:bg-neutral-50'
-              }`}
-            >
-              {recordingState === 'recording' ? <Square size={18} /> : <Mic size={18} className={recordingState === 'analyzing' ? 'animate-spin' : ''} />}
-              {recordingState === 'recording' ? 'Stop Recording' : recordingState === 'analyzing' ? 'Analyzing...' : 'Voice Claim'}
-            </button>
           </div>
         </header>
 
@@ -637,6 +643,109 @@ export default function App() {
 
             {/* Hidden Canvas for Frame Extraction */}
             <canvas ref={canvasRef} className="hidden" />
+
+            {/* Voice Claim & Questionnaire Modal Step */}
+            {sessionState === 'voice-claim' && (
+              <div className="bg-white rounded-2xl shadow-xl border border-blue-100 p-8 animate-fade-in relative z-50">
+                <div className="flex items-center justify-between mb-6">
+                  <h2 className="text-2xl font-bold text-neutral-900 flex items-center gap-2">
+                    <Mic className="text-blue-600" />
+                    Voice Claim & Questionnaire
+                  </h2>
+                  <div className="bg-blue-50 text-blue-600 text-xs font-bold px-3 py-1 rounded-full uppercase tracking-wider">
+                    Step 2 of 2
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-neutral-700 mb-1">When did the accident happen?</label>
+                      <input 
+                        type="date" 
+                        value={questionnaire.date}
+                        onChange={(e) => setQuestionnaire({...questionnaire, date: e.target.value})}
+                        className="w-full bg-neutral-50 border border-neutral-200 rounded-lg px-4 py-2.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-neutral-700 mb-1">Incident Time</label>
+                      <input 
+                        type="time" 
+                        value={questionnaire.time}
+                        onChange={(e) => setQuestionnaire({...questionnaire, time: e.target.value})}
+                        className="w-full bg-neutral-50 border border-neutral-200 rounded-lg px-4 py-2.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-neutral-700 mb-1">Incident Location</label>
+                      <input 
+                        type="text" 
+                        placeholder="e.g. MG Road, Mumbai"
+                        value={questionnaire.location}
+                        onChange={(e) => setQuestionnaire({...questionnaire, location: e.target.value})}
+                        className="w-full bg-neutral-50 border border-neutral-200 rounded-lg px-4 py-2.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-neutral-700 mb-1">Additional Details</label>
+                      <textarea 
+                        placeholder="Any other parties involved?"
+                        value={questionnaire.otherDetails}
+                        onChange={(e) => setQuestionnaire({...questionnaire, otherDetails: e.target.value})}
+                        className="w-full bg-neutral-50 border border-neutral-200 rounded-lg px-4 py-2.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all h-[42px]"
+                      ></textarea>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-neutral-900 rounded-2xl p-6 mb-8">
+                  <div className="flex flex-col items-center justify-center space-y-4">
+                    <p className="text-neutral-400 text-sm font-medium">Record your verbal statement explaining the incident</p>
+                    
+                    <button
+                      onClick={recordingState === 'recording' ? stopRecording : startRecording}
+                      disabled={recordingState === 'analyzing'}
+                      className={`w-20 h-20 rounded-full flex items-center justify-center transition-all ${
+                        recordingState === 'recording' 
+                        ? 'bg-red-500 animate-pulse text-white shadow-[0_0_20px_rgba(239,68,68,0.5)]' 
+                        : 'bg-white text-neutral-900 hover:scale-105'
+                      }`}
+                    >
+                      {recordingState === 'recording' ? <Square size={32} /> : <Mic size={32} className={recordingState === 'analyzing' ? 'animate-spin' : ''} />}
+                    </button>
+
+                    <p className={`text-lg font-bold tracking-tight ${recordingState === 'recording' ? 'text-red-400' : 'text-white'}`}>
+                      {recordingState === 'recording' ? 'LISTENING...' : recordingState === 'analyzing' ? 'ANALYZING VOICE...' : 'TAP TO RECORD'}
+                    </p>
+
+                    {(interimTranscript || rawTranscript) && (
+                      <div className="w-full max-w-lg p-4 bg-white/5 border border-white/10 rounded-xl">
+                        <p className="text-blue-400 text-xs font-bold uppercase mb-2">Live Transcript</p>
+                        <p className="text-white text-sm italic leading-relaxed">
+                          {interimTranscript || rawTranscript || "Speak now..."}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-3">
+                  <button
+                    onClick={() => {
+                        setSessionState('ended');
+                        setInspectionStatus("Inspection finalized.");
+                    }}
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-xl font-bold transition-all shadow-lg hover:shadow-blue-500/20"
+                  >
+                    Finish & View Report
+                  </button>
+                </div>
+              </div>
+            )}
 
           </div>
 
@@ -737,8 +846,8 @@ export default function App() {
 
             <button
               onClick={generatePDF}
-              disabled={sessionState !== 'ended' && snapshots.length === 0}
-              className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl font-medium transition-colors ${sessionState !== 'ended' && snapshots.length === 0
+              disabled={(sessionState !== 'ended' && sessionState !== 'voice-claim') && snapshots.length === 0}
+              className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl font-medium transition-colors ${(sessionState !== 'ended' && sessionState !== 'voice-claim') && snapshots.length === 0
                 ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed'
                 : 'bg-neutral-900 hover:bg-black text-white shadow-md'
                 }`}
