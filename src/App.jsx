@@ -22,6 +22,12 @@ export default function App() {
   const audioContextRef = useRef(null);
   const audioProcessorRef = useRef(null);
   const videoIntervalRef = useRef(null);
+  
+  // Voice Analysis State
+  const [recordingState, setRecordingState] = useState('idle'); // idle, recording, analyzing
+  const [voiceData, setVoiceData] = useState(null);
+  const [rawTranscript, setRawTranscript] = useState("");
+  const recognitionRef = useRef(null);
 
   // Load jsPDF dynamically on mount
   useEffect(() => {
@@ -236,6 +242,99 @@ export default function App() {
     setAiText("Inspection ended. You can now generate your report.");
   };
 
+  // --- VOICE ANALYSIS LOGIC (Browser STT) ---
+  const startRecording = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setError("Your browser does not support voice recognition. Please try Chrome.");
+      return;
+    }
+
+    recognitionRef.current = new SpeechRecognition();
+    recognitionRef.current.continuous = true;
+    recognitionRef.current.interimResults = true;
+    recognitionRef.current.lang = 'en-IN'; // Supports English/Hindi/Hinglish in many browsers
+
+    recognitionRef.current.onstart = () => {
+      setRecordingState('recording');
+      setRawTranscript("");
+      setAiText("Listening... Speak now.");
+    };
+
+    recognitionRef.current.onresult = (event) => {
+      let currentTranscript = "";
+      for (let i = 0; i < event.results.length; i++) {
+        currentTranscript += event.results[i][0].transcript;
+      }
+      setRawTranscript(currentTranscript);
+      setAiText(currentTranscript); // Show transcript in subtitles
+    };
+
+    recognitionRef.current.onerror = (err) => {
+      console.error("Speech Recognition Error:", err);
+      setError(`Speech recognition failed: ${err.error}`);
+      setRecordingState('idle');
+    };
+
+    recognitionRef.current.onend = () => {
+      if (recordingState === 'recording') {
+        setRecordingState('analyzing');
+      }
+    };
+
+    recognitionRef.current.start();
+  };
+
+  const stopRecording = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setRecordingState('analyzing');
+      analyzeTranscriptWithGemini(rawTranscript);
+    }
+  };
+
+  const analyzeTranscriptWithGemini = async (text) => {
+    if (!text) {
+      setRecordingState('idle');
+      setAiText("No voice input detected.");
+      return;
+    }
+
+    setAiText("Analyzing your statement...");
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: `Extract structured insurance claim data from this user statement: "${text}". 
+              The statement might be in English, Hindi, or Hinglish. 
+              Translate and return a JSON object with these keys: 
+              incident_type, date_time, vehicle_involved, location, other_parties, damage_description, summary.
+              Return ONLY JSON.` }
+            ]
+          }],
+          generationConfig: { response_mime_type: "application/json" }
+        })
+      });
+
+      if (!response.ok) throw new Error(`Gemini API error: ${response.status}`);
+      
+      const data = await response.json();
+      const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+      const result = JSON.parse(jsonText);
+      
+      setVoiceData(result);
+      setRecordingState('idle');
+      setAiText("Statement analyzed successfully.");
+    } catch (err) {
+      console.error("Analysis Error:", err);
+      setError("Failed to analyze statement.");
+      setRecordingState('idle');
+    }
+  };
+
   const generatePDF = () => {
     if (!window.jspdf) {
       setError("PDF library is still loading, please try again in a moment.");
@@ -258,7 +357,40 @@ export default function App() {
     doc.setDrawColor(200);
     doc.line(20, 32, pageWidth - 20, 32);
 
-    let yOffset = 45;
+    let yOffset = 42;
+
+    // Voice Statement Section
+    if (voiceData || rawTranscript) {
+      doc.setFillColor(245, 247, 250);
+      doc.rect(20, yOffset, pageWidth - 40, 50, 'F');
+      
+      doc.setFontSize(12);
+      doc.setTextColor(40);
+      doc.setFont(undefined, 'bold');
+      doc.text("Incident Statement Analysis", 25, yOffset + 10);
+      
+      doc.setFontSize(9);
+      doc.setFont(undefined, 'italic');
+      doc.setTextColor(100);
+      const transcriptLines = doc.splitTextToSize(`Raw Voice Input: "${rawTranscript || 'N/A'}"`, pageWidth - 50);
+      doc.text(transcriptLines, 25, yOffset + 18);
+      
+      const transcriptHeight = (transcriptLines.length * 4) + 5;
+
+      if (voiceData) {
+        doc.setFontSize(10);
+        doc.setFont(undefined, 'normal');
+        doc.setTextColor(60);
+        const summaryLines = doc.splitTextToSize(`AI Summary: ${voiceData.summary}`, pageWidth - 50);
+        doc.text(summaryLines, 25, yOffset + 18 + transcriptHeight);
+        
+        doc.setFontSize(8);
+        doc.setTextColor(120);
+        doc.text(`Type: ${voiceData.incident_type} | Location: ${voiceData.location} | Vehicle: ${voiceData.vehicle_involved}`, 25, yOffset + 18 + transcriptHeight + 12);
+      }
+      
+      yOffset += 60;
+    }
 
     if (snapshots.length === 0) {
       doc.setFontSize(14);
@@ -352,6 +484,19 @@ export default function App() {
                 <Square size={18} /> End {videoRef.current?.srcObject ? "Call" : "Analysis"}
               </button>
             )}
+
+            <button
+              onClick={recordingState === 'recording' ? stopRecording : startRecording}
+              disabled={recordingState === 'analyzing'}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${
+                recordingState === 'recording' 
+                ? 'bg-red-500 animate-pulse text-white' 
+                : 'bg-white text-neutral-700 border border-neutral-200 hover:bg-neutral-50'
+              }`}
+            >
+              {recordingState === 'recording' ? <Square size={18} /> : <Mic size={18} className={recordingState === 'analyzing' ? 'animate-spin' : ''} />}
+              {recordingState === 'recording' ? 'Stop Recording' : recordingState === 'analyzing' ? 'Analyzing...' : 'Voice Claim'}
+            </button>
           </div>
         </header>
 
@@ -478,6 +623,39 @@ export default function App() {
                 ))
               )}
             </div>
+
+            {/* Voice Data Display */}
+            {(voiceData || rawTranscript) && (
+              <div className="mb-6 p-4 bg-blue-50 border border-blue-100 rounded-xl animate-fade-in">
+                <h3 className="text-sm font-bold text-blue-900 mb-2 flex items-center gap-2">
+                  <Mic size={16} /> Incident Context
+                </h3>
+                <div className="space-y-3">
+                  {rawTranscript && (
+                    <div className="p-2 bg-blue-100/50 rounded italic text-xs text-blue-700">
+                      "{rawTranscript}"
+                    </div>
+                  )}
+                  {voiceData && (
+                    <>
+                      <p className="text-xs text-blue-800 leading-relaxed">
+                        <span className="font-bold">AI Analysis:</span> {voiceData.summary}
+                      </p>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <div className="bg-white/50 p-2 rounded border border-blue-100">
+                          <p className="text-[10px] text-blue-400 uppercase font-bold">Location</p>
+                          <p className="text-xs font-medium text-blue-900">{voiceData.location}</p>
+                        </div>
+                        <div className="bg-white/50 p-2 rounded border border-blue-100">
+                          <p className="text-[10px] text-blue-400 uppercase font-bold">Vehicle</p>
+                          <p className="text-xs font-medium text-blue-900">{voiceData.vehicle_involved || "Generic"}</p>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
 
             <button
               onClick={generatePDF}
