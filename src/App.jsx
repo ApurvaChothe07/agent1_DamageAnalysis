@@ -6,7 +6,7 @@ const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 
 export default function App() {
   const [sessionState, setSessionState] = useState('idle'); // idle, connecting, active, ended
-  const [aiText, setAiText] = useState("Waiting to start inspection...");
+  const [inspectionStatus, setInspectionStatus] = useState("Waiting to start...");
   const [snapshots, setSnapshots] = useState([]);
   const [error, setError] = useState("");
   const [isScanning, setIsScanning] = useState(false);
@@ -16,17 +16,14 @@ export default function App() {
   const videoRef = useRef(null);
   const fileInputRef = useRef(null);
   const canvasRef = useRef(null);
-  const wsRef = useRef(null);
   const streamRef = useRef(null);
-  const audioSourceRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const audioProcessorRef = useRef(null);
   const videoIntervalRef = useRef(null);
   
   // Voice Analysis State
-  const [recordingState, setRecordingState] = useState('idle'); // idle, recording, analyzing
+  const [recordingState, setRecordingState] = useState('idle');
   const [voiceData, setVoiceData] = useState(null);
   const [rawTranscript, setRawTranscript] = useState("");
+  const [interimTranscript, setInterimTranscript] = useState("");
   const recognitionRef = useRef(null);
 
   // Load jsPDF dynamically on mount
@@ -59,7 +56,7 @@ export default function App() {
   const handleStart = async (mode = 'live', file = null) => {
     setError("");
     setSnapshots([]);
-    setAiText(mode === 'live' ? "Requesting camera access..." : "Preparing video for analysis...");
+    setInspectionStatus(mode === 'live' ? "Requesting camera access..." : "Preparing video...");
     setSessionState('active');
     setTelemetry(prev => ({ ...prev, apiStatus: "ACTIVE" }));
 
@@ -70,6 +67,9 @@ export default function App() {
         });
         streamRef.current = stream;
         if (videoRef.current) videoRef.current.srcObject = stream;
+        
+        // Auto-start microphone for hands-free claims
+        startRecording();
       } else if (mode === 'upload' && file) {
         const url = URL.createObjectURL(file);
         if (videoRef.current) {
@@ -154,7 +154,7 @@ export default function App() {
           body: JSON.stringify({
             contents: [{
               parts: [
-                { text: "Analyze this frame for vehicle/property damage. Return a JSON object with: { damage_found: boolean, component: string, type: string, severity: number, description: string }. Only return JSON." },
+                { text: "Analyze this frame for vehicle or property damage. Be precise but thorough—look for scratches, dents, cracks, or misalignment. Return a JSON object with: { damage_found: boolean, component: string, type: string, severity: number, description: string }. If you see damage, ensure damage_found is true. Only return JSON." },
                 { inline_data: { mime_type: "image/jpeg", data: base64Data } }
               ]
             }],
@@ -166,7 +166,7 @@ export default function App() {
 
         if (response.status === 429) {
           console.warn("[Analysis] Rate limit hit. Cooling down for 15s...");
-          setAiText("AI system cooling down (rate limit)...");
+          setInspectionStatus("AI system cooling down (rate limit)...");
           timeoutId = setTimeout(runAnalysis, 15000);
           return;
         }
@@ -192,7 +192,7 @@ export default function App() {
             dataUrl
           );
         } else {
-          setAiText("Scanning... No new damage detected.");
+          setInspectionStatus("Scanning... No new damage detected.");
         }
 
       } catch (err) {
@@ -233,53 +233,99 @@ export default function App() {
       if (exists) return prev;
       return [...prev, snapshotData];
     });
-    setAiText(`Detected damage: ${classification} on ${component}.`);
+    setInspectionStatus(`Detected: ${classification} on ${component}.`);
   };
 
   const handleStop = () => {
     stopAll();
+    stopRecording();
     setSessionState('ended');
-    setAiText("Inspection ended. You can now generate your report.");
+    setInspectionStatus("Inspection ended. Report generated.");
+  };
+
+  const handleForceCapture = async () => {
+    if (!canvasRef.current || !videoRef.current) return;
+    
+    setInspectionStatus("Capturing manual evidence...");
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    canvas.width = videoRef.current.videoWidth || 720;
+    canvas.height = videoRef.current.videoHeight || 720;
+    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    const base64Data = dataUrl.split(',')[1];
+
+    try {
+      setTelemetry(prev => ({ ...prev, apiStatus: "FORCING SCAN..." }));
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: "Detailedly describe the vehicle damage in this specific frame. Return a JSON object with: { damage_found: true, component: string, type: string, severity: number, description: string }. This is a user-forced capture, so describe what is visible even if minor. Only return JSON." },
+              { inline_data: { mime_type: "image/jpeg", data: base64Data } }
+            ]
+          }],
+          generationConfig: { response_mime_type: "application/json" }
+        })
+      });
+
+      const data = await response.json();
+      const result = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text || "{}");
+      
+      handleManualCapture(
+        result.component || "Manual Capture",
+        result.type || "Visual Evidence",
+        result.severity || 5,
+        result.description || "Manual evidence logged by user.",
+        dataUrl
+      );
+      setTelemetry(prev => ({ ...prev, apiStatus: "ACTIVE" }));
+    } catch (err) {
+      console.error("Force capture failed:", err);
+      setInspectionStatus("Capture failed. Try again.");
+    }
   };
 
   // --- VOICE ANALYSIS LOGIC (Browser STT) ---
   const startRecording = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setError("Your browser does not support voice recognition. Please try Chrome.");
-      return;
-    }
+    if (!SpeechRecognition) return;
 
     recognitionRef.current = new SpeechRecognition();
     recognitionRef.current.continuous = true;
     recognitionRef.current.interimResults = true;
-    recognitionRef.current.lang = 'en-IN'; // Supports English/Hindi/Hinglish in many browsers
+    recognitionRef.current.lang = 'en-IN';
 
     recognitionRef.current.onstart = () => {
       setRecordingState('recording');
       setRawTranscript("");
-      setAiText("Listening... Speak now.");
+      setInterimTranscript("");
     };
 
     recognitionRef.current.onresult = (event) => {
-      let currentTranscript = "";
-      for (let i = 0; i < event.results.length; i++) {
-        currentTranscript += event.results[i][0].transcript;
+      let finalTranscript = "";
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interim += event.results[i][0].transcript;
+        }
       }
-      setRawTranscript(currentTranscript);
-      setAiText(currentTranscript); // Show transcript in subtitles
+      setRawTranscript(prev => prev + finalTranscript);
+      setInterimTranscript(interim);
     };
 
     recognitionRef.current.onerror = (err) => {
-      console.error("Speech Recognition Error:", err);
-      setError(`Speech recognition failed: ${err.error}`);
+      console.error("Speech Error:", err);
       setRecordingState('idle');
     };
 
     recognitionRef.current.onend = () => {
-      if (recordingState === 'recording') {
-        setRecordingState('analyzing');
-      }
+      if (recordingState === 'recording') setRecordingState('analyzing');
     };
 
     recognitionRef.current.start();
@@ -294,46 +340,57 @@ export default function App() {
   };
 
   const analyzeTranscriptWithGemini = async (text) => {
-    if (!text) {
+    const contentToAnalyze = text || rawTranscript;
+    if (!contentToAnalyze || contentToAnalyze.length < 5) {
       setRecordingState('idle');
-      setAiText("No voice input detected.");
       return;
     }
 
-    setAiText("Analyzing your statement...");
+    setInspectionStatus("Finalizing statement...");
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      const fetchWithRetry = async (url, options, retries = 2, backoff = 2000) => {
+        try {
+          const res = await fetch(url, options);
+          if (!res.ok && (res.status === 503 || res.status === 500) && retries > 0) {
+            await new Promise(r => setTimeout(r, backoff));
+            return fetchWithRetry(url, options, retries - 1, backoff * 2);
+          }
+          return res;
+        } catch (e) {
+          if (retries > 0) {
+            await new Promise(r => setTimeout(r, backoff));
+            return fetchWithRetry(url, options, retries - 1, backoff * 2);
+          }
+          throw e;
+        }
+      };
+
+      const response = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{
             parts: [
-              { text: `Extract structured insurance claim data from this user statement: "${text}". 
-              The statement might be in English, Hindi, or Hinglish. 
-              Translate and return a JSON object with these keys: 
-              incident_type, date_time, vehicle_involved, location, other_parties, damage_description, summary.
-              Return ONLY JSON.` }
+              { text: `Extract data from: "${contentToAnalyze}". JSON format: incident_type, date_time, vehicle_involved, location, other_parties, damage_description, summary. ONLY JSON.` }
             ]
           }],
           generationConfig: { response_mime_type: "application/json" }
         })
       });
 
-      if (!response.ok) throw new Error(`Gemini API error: ${response.status}`);
-      
+      if (!response.ok) throw new Error(`API error: ${response.status}`);
       const data = await response.json();
-      const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-      const result = JSON.parse(jsonText);
+      const result = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text || "{}");
       
       setVoiceData(result);
       setRecordingState('idle');
-      setAiText("Statement analyzed successfully.");
+      setInspectionStatus("Analysis complete.");
     } catch (err) {
-      console.error("Analysis Error:", err);
-      setError("Failed to analyze statement.");
+      console.error(err);
       setRecordingState('idle');
     }
   };
+
 
   const generatePDF = () => {
     if (!window.jspdf) {
@@ -357,79 +414,75 @@ export default function App() {
     doc.setDrawColor(200);
     doc.line(20, 32, pageWidth - 20, 32);
 
-    let yOffset = 42;
+    let yOffset = 45;
 
-    // Voice Statement Section
+    // --- RE-IMPLEMENTING PREMIUM GREY BOX ---
     if (voiceData || rawTranscript) {
       doc.setFillColor(245, 247, 250);
-      doc.rect(20, yOffset, pageWidth - 40, 50, 'F');
+      doc.rect(20, yOffset, pageWidth - 40, 60, 'F');
       
-      doc.setFontSize(12);
+      doc.setFontSize(13);
       doc.setTextColor(40);
       doc.setFont(undefined, 'bold');
-      doc.text("Incident Statement Analysis", 25, yOffset + 10);
+      doc.text("Incident Statement Analysis", 25, yOffset + 12);
       
       doc.setFontSize(9);
       doc.setFont(undefined, 'italic');
-      doc.setTextColor(100);
-      const transcriptLines = doc.splitTextToSize(`Raw Voice Input: "${rawTranscript || 'N/A'}"`, pageWidth - 50);
-      doc.text(transcriptLines, 25, yOffset + 18);
+      doc.setTextColor(110);
+      const transcriptStr = rawTranscript || "No verbal statement recorded.";
+      const transcriptLines = doc.splitTextToSize(`Raw Voice Input: "${transcriptStr}"`, pageWidth - 50);
+      doc.text(transcriptLines, 25, yOffset + 22);
       
-      const transcriptHeight = (transcriptLines.length * 4) + 5;
-
       if (voiceData) {
-        doc.setFontSize(10);
+        doc.setFontSize(9);
         doc.setFont(undefined, 'normal');
-        doc.setTextColor(60);
-        const summaryLines = doc.splitTextToSize(`AI Summary: ${voiceData.summary}`, pageWidth - 50);
-        doc.text(summaryLines, 25, yOffset + 18 + transcriptHeight);
+        doc.setTextColor(80);
+        doc.text(`AI Summary: ${voiceData.summary || 'Summary pending.'}`, 25, yOffset + 42);
         
-        doc.setFontSize(8);
-        doc.setTextColor(120);
-        doc.text(`Type: ${voiceData.incident_type} | Location: ${voiceData.location} | Vehicle: ${voiceData.vehicle_involved}`, 25, yOffset + 18 + transcriptHeight + 12);
+        if (voiceData.damage_description) {
+          const vDamageLines = doc.splitTextToSize(`Reported Damage: ${voiceData.damage_description}`, pageWidth - 50);
+          doc.text(vDamageLines, 25, yOffset + 50);
+        }
       }
-      
-      yOffset += 60;
+      yOffset += 75;
     }
 
+    doc.setFontSize(15);
+    doc.setTextColor(40);
+    doc.setFont(undefined, 'bold');
+    doc.text("Visual Evidence Details", 20, yOffset);
+    yOffset += 10;
+
     if (snapshots.length === 0) {
-      doc.setFontSize(14);
-      doc.setTextColor(40);
-      doc.text("No damage was identified during this session.", 20, yOffset);
+      doc.setFontSize(11);
+      doc.setFont(undefined, 'italic');
+      doc.setTextColor(120);
+      doc.text("No visual damage was identified during this session.", 20, yOffset + 10);
     } else {
       snapshots.forEach((snap, index) => {
-        // Pagination check
-        if (yOffset > 220) {
-          doc.addPage();
-          yOffset = 20;
-        }
-
-        doc.setFontSize(14);
+        if (yOffset > 210) { doc.addPage(); yOffset = 20; }
+        
+        doc.setFontSize(13);
         doc.setTextColor(40);
         doc.setFont(undefined, 'bold');
         doc.text(`Finding ${index + 1}: ${snap.component} - ${snap.classification}`, 20, yOffset);
         
-        doc.setFontSize(11);
+        doc.setFontSize(10);
         doc.setFont(undefined, 'italic');
         doc.setTextColor(80);
-        
-        // Dynamic text wrapping and height calculation
         const descriptionLines = doc.splitTextToSize(snap.description, pageWidth - 40);
         doc.text(descriptionLines, 20, yOffset + 8);
         
-        // Move yOffset based on description length
         const descriptionHeight = (descriptionLines.length * 5) + 5;
         const severityY = yOffset + 8 + descriptionHeight;
 
-        doc.setFontSize(10);
+        doc.setFontSize(9);
         doc.setFont(undefined, 'normal');
         doc.setTextColor(120);
         doc.text(`Severity: ${snap.severity}/10  |  Time logged: ${snap.timestamp}`, 20, severityY);
 
-        // Add Image below everything
-        doc.addImage(snap.image, 'JPEG', 20, severityY + 8, 120, 90);
-
-        yOffset = severityY + 110;
+        doc.addImage(snap.image, 'JPEG', 20, severityY + 8, 140, 105);
+        yOffset = severityY + 120;
       });
     }
 
@@ -482,6 +535,15 @@ export default function App() {
                 className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white px-5 py-2.5 rounded-lg font-medium transition-colors"
               >
                 <Square size={18} /> End {videoRef.current?.srcObject ? "Call" : "Analysis"}
+              </button>
+            )}
+
+            {sessionState === 'active' && (
+              <button
+                onClick={handleForceCapture}
+                className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-5 py-2.5 rounded-lg font-medium transition-colors"
+              >
+                <Camera size={18} /> Log Damage
               </button>
             )}
 
@@ -549,13 +611,24 @@ export default function App() {
                 </div>
               )}
 
-              {/* AI Subtitles Overlay */}
+              {/* AI Subtitles & Live Transcript Overlay */}
               {sessionState !== 'idle' && (
-                <div className="absolute bottom-6 left-0 right-0 flex justify-center px-4">
-                  <div className="bg-neutral-900/80 backdrop-blur-md text-white px-6 py-3 rounded-xl max-w-xl text-center shadow-lg border border-white/10 transition-all duration-300 transform translate-y-0">
+                <div className="absolute bottom-6 left-0 right-0 flex flex-col items-center gap-3 px-4 z-20">
+                  {/* Active Speech Overlay */}
+                  {(interimTranscript || rawTranscript) && recordingState === 'recording' && (
+                    <div className="bg-blue-600/90 backdrop-blur-md text-white px-4 py-2 rounded-lg shadow-lg border border-white/20 animate-pulse flex items-center gap-2 max-w-lg">
+                      <Mic size={14} className="text-blue-100" />
+                      <p className="text-sm font-medium italic">
+                        {interimTranscript || "..."}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Scan Status Overlay */}
+                  <div className="bg-neutral-900/80 backdrop-blur-md text-white px-6 py-3 rounded-xl max-w-xl text-center shadow-lg border border-white/10 transition-all">
                     <p className="font-medium text-lg flex items-center gap-2 justify-center">
-                      <Mic size={18} className="text-blue-400" />
-                      {aiText}
+                      <Camera size={18} className="text-blue-400" />
+                      {inspectionStatus}
                     </p>
                   </div>
                 </div>
@@ -641,6 +714,11 @@ export default function App() {
                       <p className="text-xs text-blue-800 leading-relaxed">
                         <span className="font-bold">AI Analysis:</span> {voiceData.summary}
                       </p>
+                      {voiceData.damage_description && (
+                        <p className="text-xs text-blue-700 mt-1 italic">
+                          <span className="font-bold not-italic">Verbal Damage:</span> {voiceData.damage_description}
+                        </p>
+                      )}
                       <div className="grid grid-cols-2 gap-2 mt-2">
                         <div className="bg-white/50 p-2 rounded border border-blue-100">
                           <p className="text-[10px] text-blue-400 uppercase font-bold">Location</p>
